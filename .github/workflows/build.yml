@@ -1,0 +1,53 @@
+name: Build
+
+on:
+  push:
+    tags:
+      - 'v*'          # trigger on version tags, e.g. v1.0.0
+  workflow_dispatch:  # allow manual runs from the Actions tab
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            script: dist:mac
+            artifacts: dist/*.dmg
+          - os: windows-latest
+            script: dist:win
+            artifacts: dist/*.exe
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: Install sub-package dependencies
+        run: |
+          npm --prefix browser-server ci
+          npm --prefix figma-server ci
+
+      - name: Build distributable
+        run: npm run ${{ matrix.script }}
+        env:
+          # Suppress electron-builder publish (no credentials needed for local builds)
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: FaunaMCP-${{ matrix.os }}
+          path: ${{ matrix.artifacts }}
+          if-no-files-found: error
