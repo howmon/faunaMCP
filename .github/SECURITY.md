@@ -8,7 +8,7 @@ The latest `main` branch is considered supported.
 
 Please report security issues privately and do not open a public issue.
 
-Send a report to: security@your-domain.example
+Send a report to: awakejournal@gmail.com
 
 Include as much detail as possible:
 
