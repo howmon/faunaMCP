@@ -9,3 +9,4 @@ coverage/
 .env
 .env.*
 figma-plugin/manifest-sample.json
+figma-plugin/manifest-sample.json
