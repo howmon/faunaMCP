@@ -14,6 +14,7 @@
  */
 
 const RELAY_WS_URL       = 'ws://localhost:3340';
+const RELAY_HEALTH_URL   = 'http://localhost:3341/health';
 const RECONNECT_BASE_MS  = 1500;
 const RECONNECT_MAX_MS   = 30000;
 const PING_INTERVAL_MS   = 20000;
@@ -26,12 +27,34 @@ let reconnectDelay = RECONNECT_BASE_MS;
 let pingTimer      = null;
 let connected      = false;
 let _activeTabId   = null;
+let contextMenusReady = Promise.resolve();
 
 // ── WebSocket lifecycle ───────────────────────────────────────────────────
 
-function connect() {
+async function relayAvailable() {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 1000);
+  try {
+    const response = await fetch(RELAY_HEALTH_URL, { signal: controller.signal, cache: 'no-store' });
+    return response.ok;
+  } catch (_) {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function connect() {
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
   clearTimeout(reconnectTimer);
+
+  if (!await relayAvailable()) {
+    connected = false;
+    broadcastStatus();
+    scheduleReconnect();
+    return;
+  }
+
   ws = new WebSocket(RELAY_WS_URL);
 
   ws.addEventListener('open', () => {
@@ -78,6 +101,23 @@ function startPing() {
   }, PING_INTERVAL_MS);
 }
 function stopPing() { clearInterval(pingTimer); pingTimer = null; }
+
+function createContextMenus() {
+  contextMenusReady = contextMenusReady.catch(() => {}).then(async () => {
+    await chrome.contextMenus.removeAll().catch(() => {});
+    chrome.contextMenus.create({
+      id: 'mcp-extract-page',
+      title: 'Extract page (MCP)',
+      contexts: ['page', 'frame']
+    });
+    chrome.contextMenus.create({
+      id: 'mcp-snapshot',
+      title: 'Snapshot page (MCP)',
+      contexts: ['page', 'frame']
+    });
+  });
+  return contextMenusReady;
+}
 
 function send(obj) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -226,21 +266,123 @@ function waitForTabLoad(tabId, timeoutMs = 20000) {
 
 async function msgTab(tab, msg) {
   if (!tab) throw new Error('No active tab');
-  return await chrome.tabs.sendMessage(tab.id, msg);
+  try {
+    return await chrome.tabs.sendMessage(tab.id, msg);
+  } catch (err) {
+    if (_isConnectError(err)) {
+      await _injectContentScript(tab);
+      return await chrome.tabs.sendMessage(tab.id, msg);
+    }
+    throw err;
+  }
+}
+
+function _isHostAccessError(err) {
+  var msg = String((err && err.message) || err || '');
+  return /Cannot access contents of the page|host permission|Missing host permission|Cannot access a chrome:\/\/ URL/i.test(msg);
+}
+
+function _isConnectError(err) {
+  var msg = String((err && err.message) || err || '');
+  return /Receiving end does not exist|Could not establish connection|No tab with id/i.test(msg);
+}
+
+function _permissionPatternFromUrl(url) {
+  try {
+    var u = new URL(url);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+    return u.protocol + '//' + u.hostname + '/*';
+  } catch (_) {
+    return null;
+  }
+}
+
+async function _ensureTabHostPermission(tab) {
+  var pattern = _permissionPatternFromUrl(tab && tab.url);
+  if (!pattern) {
+    throw new Error('Cannot access this page. Open an http(s) site or grant extension access for this page type.');
+  }
+  if (!chrome.permissions || typeof chrome.permissions.contains !== 'function' || typeof chrome.permissions.request !== 'function') {
+    return;
+  }
+  var has = await chrome.permissions.contains({ origins: [pattern] }).catch(function() { return false; });
+  if (has) return;
+  var granted = await chrome.permissions.request({ origins: [pattern] }).catch(function() { return false; });
+  if (!granted) {
+    throw new Error('Site access not granted for ' + pattern + '. In extension settings, allow access on this site or on all sites.');
+  }
+}
+
+async function _injectContentScript(tab) {
+  try {
+    await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] });
+  } catch (err) {
+    if (_isHostAccessError(err)) {
+      await _ensureTabHostPermission(tab);
+      await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] });
+      return;
+    }
+    throw err;
+  }
 }
 
 // ── Extract ───────────────────────────────────────────────────────────────
 
 async function cmdExtract({ maxChars = 12000 } = {}, tab) {
   if (!tab) return { ok: false, error: 'No active tab' };
-  let data;
   try {
-    data = await msgTab(tab, { action: 'extract', maxChars });
-  } catch (_) {
-    await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] });
-    data = await msgTab(tab, { action: 'extract', maxChars });
+    var data = await msgTab(tab, { action: 'extract', maxChars });
+    return { ok: true, ...data };
+  } catch (err1) {
+    try {
+      return await _extractViaDebugger(tab, maxChars);
+    } catch (err2) {
+      if (_isHostAccessError(err1) || _isHostAccessError(err2)) {
+        return { ok: false, error: 'Cannot access this page. Grant site access to the extension for this site and try again.' };
+      }
+      return { ok: false, error: (err2 && err2.message) || (err1 && err1.message) || 'Page extraction failed' };
+    }
   }
-  return { ok: true, ...data };
+}
+
+async function _extractViaDebugger(tab, maxChars) {
+  var limit = Math.max(500, Math.min(Number(maxChars) || 12000, 50000));
+  return await _dbgSession(tab.id, async (target) => {
+    await chrome.debugger.sendCommand(target, 'Runtime.enable', {});
+    const evalResult = await chrome.debugger.sendCommand(target, 'Runtime.evaluate', {
+      expression: `(function(){
+        var txt = '';
+        try { txt = ((document.body && document.body.innerText) || '').trim(); } catch (_) {}
+        if (!txt) {
+          try { txt = ((document.documentElement && document.documentElement.innerText) || '').trim(); } catch (_) {}
+        }
+        var links = [];
+        try {
+          links = Array.from(document.querySelectorAll('a[href]')).slice(0, 30).map(function(a){
+            return { text: (a.innerText || '').trim().slice(0, 120), href: a.href };
+          });
+        } catch (_) {}
+        return JSON.stringify({
+          title: document.title || '',
+          url: location.href || '',
+          text: (txt || '').slice(0, ${limit}),
+          links: links
+        });
+      })()`,
+      returnByValue: true,
+      awaitPromise: false,
+    });
+    var data = {};
+    try { data = JSON.parse(evalResult?.result?.value || '{}'); } catch (_) { data = {}; }
+    return {
+      ok: true,
+      title: data.title || tab.title || '',
+      url: data.url || tab.url || '',
+      text: data.text || '',
+      links: Array.isArray(data.links) ? data.links : [],
+      method: 'debugger'
+    };
+  });
 }
 
 async function cmdExtractForms({} = {}, tab) {
@@ -251,14 +393,15 @@ async function cmdExtractForms({} = {}, tab) {
 
 async function cmdExtractAssets({} = {}, tab) {
   if (!tab) return { ok: false, error: 'No active tab' };
-  let data;
   try {
-    data = await msgTab(tab, { action: 'extract-assets' });
-  } catch (_) {
-    await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] });
-    data = await msgTab(tab, { action: 'extract-assets' });
+    var data = await msgTab(tab, { action: 'extract-assets' });
+    return { ok: true, ...data };
+  } catch (err) {
+    if (_isHostAccessError(err)) {
+      return { ok: false, error: 'Cannot access this page. Grant site access to the extension for this site and try again.' };
+    }
+    throw err;
   }
-  return { ok: true, ...data };
 }
 
 async function cmdGetDims({} = {}, tab) {
@@ -628,16 +771,7 @@ chrome.commands.onCommand.addListener(async (command) => {
 // ── Context menus ─────────────────────────────────────────────────────────
 
 chrome.runtime.onInstalled.addListener(() => {
-  chrome.contextMenus.create({
-    id: 'mcp-extract-page',
-    title: 'Extract page (MCP)',
-    contexts: ['page', 'frame']
-  });
-  chrome.contextMenus.create({
-    id: 'mcp-snapshot',
-    title: 'Snapshot page (MCP)',
-    contexts: ['page', 'frame']
-  });
+  createContextMenus();
   connect();
 });
 
@@ -718,4 +852,5 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────
 
+createContextMenus();
 connect();
